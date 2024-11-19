@@ -1,0 +1,16 @@
+{
+  "_class_name": "UpscaleAVideoPipeline",
+  "low_res_scheduler": [
+    "diffusers",
+    "DDPMScheduler"
+  ],
+  "max_noise_level": 200,
+  "text_encoder": [
+    "transformers",
+    "CLIPTextModel"
+  ],
+  "tokenizer": [
+    "transformers",
+    "CLIPTokenizer"
+  ]
+}

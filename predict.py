@@ -95,25 +95,63 @@ class UpscaleConfig(BaseModel):
         for key, value in env_vars.items():
             os.environ[key] = value
 
+def verify_downloaded_files(model_cache: Path) -> bool:
+    """Verify if required model files exist in cache."""
+    required_files = [
+        "upscale_a_video/vae/vae_3d.bin",
+        "upscale_a_video/vae/vae_video.bin",
+        "upscale_a_video/unet/unet_video.bin",
+        "upscale_a_video/propagator/raft-things.pth"
+    ]
+    return all((model_cache / file).exists() for file in required_files)
+
 def download_weights(config: UpscaleConfig) -> None:
-    """Download model weights if not present."""
+    """Download and extract model weights."""
+    if verify_downloaded_files(config.model_cache):
+        logger.info("Required model files already exist in cache")
+        return
+        
+    config.model_cache.mkdir(parents=True, exist_ok=True)
+    tar_path = config.model_cache / "model_cache.tar"
+    
     try:
-        if config.model_cache.exists():
-            logger.info("Model weights already exist")
-            return
-            
-        start = time.time()
+        # Download with wget showing progress
         logger.info(f"Downloading weights from: {config.model_url}")
+        subprocess.check_call([
+            "wget",
+            "--progress=bar:force",
+            "--show-progress",
+            "-O", str(tar_path),
+            config.model_url
+        ], stderr=subprocess.STDOUT)
         
-        subprocess.check_call(
-            ["wget", "-x", config.model_url, str(config.model_cache)],
-            close_fds=False
-        )
+        # Extract tar file
+        logger.info("Extracting weights...")
+        subprocess.check_call([
+            "tar",
+            "-xf",
+            str(tar_path),
+            "-C", str(config.model_cache),
+            "--strip-components=1"
+        ])
         
-        logger.info(f"Download completed in {time.time() - start:.2f}s")
+        # Verify extraction
+        if not verify_downloaded_files(config.model_cache):
+            raise RuntimeError("Model files missing after extraction")
+            
+        # Cleanup
+        tar_path.unlink()
+        logger.info("Download and extraction complete")
         
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Command failed with return code {e.returncode}")
+        if tar_path.exists():
+            tar_path.unlink()
+        raise
     except Exception as e:
-        logger.error(f"Failed to download weights: {str(e)}")
+        logger.error(f"Failed to process weights: {str(e)}")
+        if tar_path.exists():
+            tar_path.unlink()
         raise
 
 def setup_devices() -> Tuple[str, str]:
@@ -507,19 +545,25 @@ class UpscaleVideoInference:
         output = rearrange(output, 't c h w -> t h w c')
         output = output.cpu().numpy().astype(np.uint8)
         
-        # Save video
-        try:
-            imageio.mimwrite(
-                str(save_path),
-                output,
-                fps=fps,
-                quality=8,  # Highest quality is 10
-                output_params=["-loglevel", "error"]
-            )
-            logger.info(f"Saved video to: {save_path}")
-        except Exception as e:
-            logger.error(f"Error saving video: {e}")
-            raise
+        # Save video with retry mechanism
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                imageio.mimwrite(
+                    str(save_path),
+                    output,
+                    fps=fps,
+                    quality=8,
+                    output_params=["-loglevel", "error"]
+                )
+                logger.info(f"Saved video to: {save_path}")
+                break
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logger.error(f"Failed to save video after {max_retries} attempts: {e}")
+                    raise
+                logger.warning(f"Attempt {attempt + 1} failed, retrying...")
+                time.sleep(1)
             
         return save_path
 
@@ -536,6 +580,7 @@ def main():
             logger.info(f"GPU count: {torch.cuda.device_count()}")
             for i in range(torch.cuda.device_count()):
                 logger.info(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+                logger.info(f"GPU {i} memory: {torch.cuda.get_device_properties(i).total_memory / 1024**3:.1f}GB")
         
         # Initialize upscaler
         upscaler = UpscaleVideoInference(config)
@@ -547,9 +592,13 @@ def main():
                 raise ValueError(f"Video format must be one of {VIDEO_EXTENSIONS}")
             video_paths = [input_path]
         else:
-            video_paths = [p for p in input_path.glob("*") if p.suffix in VIDEO_EXTENSIONS]
+            video_paths = [p for p in input_path.glob("*") if p.suffix.lower() in VIDEO_EXTENSIONS]
             
         total_videos = len(video_paths)
+        if total_videos == 0:
+            logger.warning(f"No video files found in {input_path}")
+            return
+            
         logger.info(f"Found {total_videos} videos to process")
         
         # Process videos
@@ -559,6 +608,10 @@ def main():
         for idx, video_path in enumerate(video_paths, 1):
             logger.info(f"Processing video {idx}/{total_videos}: {video_path}")
             try:
+                # Check file size
+                file_size = video_path.stat().st_size / (1024 * 1024)  # Size in MB
+                logger.info(f"Video size: {file_size:.2f}MB")
+                
                 output_path = upscaler.process_video(video_path)
                 successful += 1
                 logger.success(f"Successfully processed: {video_path} -> {output_path}")
@@ -568,10 +621,13 @@ def main():
                 continue
                 
         # Log summary
-        logger.info("Processing complete:")
+        logger.info("\nProcessing Summary:")
+        logger.info("=" * 50)
         logger.info(f"Total videos: {total_videos}")
         logger.info(f"Successful: {successful}")
         logger.info(f"Failed: {failed}")
+        if failed > 0:
+            logger.warning("Some videos failed to process. Check logs for details.")
                 
     except Exception as e:
         logger.exception("Fatal error")
